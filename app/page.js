@@ -222,6 +222,11 @@ export default function App() {
           const gross = Number(val);
           const par = Number(courseHole?.par || 0);
           const pairHcp = scrambleHandicap(p1, p2);
+          const roundedPairHcp = Math.round(pairHcp);
+          const full = Math.floor(roundedPairHcp / 18);
+          const extra = roundedPairHcp % 18;
+          const holeStrokes = courseHole ? full + (courseHole.stroke_index <= extra ? 1 : 0) : 0;
+          const net = gross - holeStrokes;
 
           rows.push({
             matchup_id: m.id,
@@ -230,10 +235,10 @@ export default function App() {
             team_id: teamId,
             hole_number: Number(hole),
             gross_score: gross,
-            handicap_strokes: pairHcp,
-            net_score: gross,
+            handicap_strokes: holeStrokes,
+            net_score: net,
             gross_to_par: par ? gross - par : null,
-            birdie_bonus_points: par && gross <= par - 1 ? Number(round.birdie_bonus || 1) : 0,
+            birdie_bonus_points: par && net <= par - 1 ? Number(round.birdie_bonus || 1) : 0,
             entered_by: user.id,
           });
         }
@@ -280,6 +285,85 @@ export default function App() {
     } catch (e) {
       setErr(e.message);
     }
+  }
+
+  function scrambleHoleStrokes(m, side, ch) {
+    const p1 = player(m[`${side}_player1_id`]);
+    const p2 = player(m[`${side}_player2_id`]);
+    const rounded = Math.round(scrambleHandicap(p1, p2));
+    if (!ch) return 0;
+    const full = Math.floor(rounded / 18);
+    const extra = rounded % 18;
+    return full + (ch.stroke_index <= extra ? 1 : 0);
+  }
+
+  function matchupHoleResult(m, r, holeNumber) {
+    const ch = (r?.courses?.course_holes || []).find((x) => x.hole_number === holeNumber);
+    if (!ch) return null;
+    const par = Number(ch.par);
+    let aBase = 0, bBase = 0, aBonus = 0, bBonus = 0;
+
+    if (r.format === "scramble") {
+      const a = scrambleScores.find((x) => x.matchup_id === m.id && x.team_id === team1?.id && x.hole_number === holeNumber);
+      const b = scrambleScores.find((x) => x.matchup_id === m.id && x.team_id === team2?.id && x.hole_number === holeNumber);
+      if (!a || !b) return null;
+      const aNet = Number(a.gross_score) - scrambleHoleStrokes(m, "team1", ch);
+      const bNet = Number(b.gross_score) - scrambleHoleStrokes(m, "team2", ch);
+      if (aNet < bNet) aBase = 2; else if (bNet < aNet) bBase = 2; else { aBase = 1; bBase = 1; }
+      if (aNet <= par - 1) aBonus += 1;
+      if (bNet <= par - 1) bBonus += 1;
+      return { aBase, bBase, aBonus, bBonus, aTotal: aBase + aBonus, bTotal: bBase + bBonus, aNet, bNet };
+    }
+
+    const aPlayers = [player(m.team1_player1_id), player(m.team1_player2_id)].filter(Boolean);
+    const bPlayers = [player(m.team2_player1_id), player(m.team2_player2_id)].filter(Boolean);
+    const get = (p) => scores.find((x) => x.round_id === r.id && x.player_id === p.id && x.hole_number === holeNumber);
+    const aRows = aPlayers.map((p) => ({ p, s: get(p) }));
+    const bRows = bPlayers.map((p) => ({ p, s: get(p) }));
+    if (aRows.some((x) => !x.s) || bRows.some((x) => !x.s) || aRows.length !== 2 || bRows.length !== 2) return null;
+    const nets = (rows) => rows.map(({ p, s }) => Number(s.gross_score) - strokesForHole(p, ch));
+    const an = nets(aRows), bn = nets(bRows);
+
+    if (r.format === "best_ball") {
+      const aBest = Math.min(...an), bBest = Math.min(...bn);
+      if (aBest < bBest) aBase = 2; else if (bBest < aBest) bBase = 2; else { aBase = 1; bBase = 1; }
+      aBonus = an.filter((n) => n <= par - 1).length;
+      bBonus = bn.filter((n) => n <= par - 1).length;
+      return { aBase, bBase, aBonus, bBonus, aTotal: aBase + aBonus, bTotal: bBase + bBonus, aNet: aBest, bNet: bBest };
+    }
+
+    if (r.format === "high_low") {
+      const aLow = Math.min(...an), bLow = Math.min(...bn), aHigh = Math.max(...an), bHigh = Math.max(...bn);
+      if (aLow < bLow) aBase += 1; else if (bLow < aLow) bBase += 1; else { aBase += .5; bBase += .5; }
+      if (aHigh < bHigh) aBase += 1; else if (bHigh < aHigh) bBase += 1; else { aBase += .5; bBase += .5; }
+      const bonus = (ns) => ns.reduce((sum, n) => sum + (n <= par - 2 ? 2 : n === par - 1 ? 1 : 0), 0);
+      aBonus = bonus(an); bBonus = bonus(bn);
+      return { aBase, bBase, aBonus, bBonus, aTotal: aBase + aBonus, bTotal: bBase + bBonus, aNet: aLow, bNet: bLow };
+    }
+    return null;
+  }
+
+  function matchupSummary(m, r) {
+    const holes = [...Array(18)].map((_, i) => matchupHoleResult(m, r, i + 1));
+    const sumRange = (start, end, side) => holes.slice(start - 1, end).reduce((n, x) => n + (x ? x[side] : 0), 0);
+    const completeRange = (start, end) => holes.slice(start - 1, end).every(Boolean);
+    const aFrontRaw = sumRange(1, 9, "aTotal"), bFrontRaw = sumRange(1, 9, "bTotal");
+    const aBackRaw = sumRange(10, 18, "aTotal"), bBackRaw = sumRange(10, 18, "bTotal");
+    let aFront = 0, bFront = 0, aBack = 0, bBack = 0;
+    if (completeRange(1, 9)) { if (aFrontRaw > bFrontRaw) aFront = 5; else if (bFrontRaw > aFrontRaw) bFront = 5; else { aFront = 2.5; bFront = 2.5; } }
+    if (completeRange(10, 18)) { if (aBackRaw > bBackRaw) aBack = 5; else if (bBackRaw > aBackRaw) bBack = 5; else { aBack = 2.5; bBack = 2.5; } }
+    const aHole = sumRange(1, 18, "aTotal"), bHole = sumRange(1, 18, "bTotal");
+    return { holes, aHole, bHole, aFront, bFront, aBack, bBack, aTotal: aHole + aFront + aBack, bTotal: bHole + bFront + bBack };
+  }
+
+  function teamTournamentTotals() {
+    let a = 0, b = 0;
+    rounds.filter((r) => r.round_number <= 4).forEach((r) => {
+      matchups.filter((m) => m.round_id === r.id).forEach((m) => {
+        const x = matchupSummary(m, r); a += x.aTotal; b += x.bTotal;
+      });
+    });
+    return { a, b };
   }
 
   async function send() {
@@ -347,6 +431,13 @@ export default function App() {
             <h1>JANDER CUP</h1>
             <p>Cranbrook, British Columbia</p>
           </div>
+
+          <Card title="Live Jander Cup Score">
+            {(() => {
+              const total = teamTournamentTotals();
+              return <div className="row"><b>{team1?.name || "Team 1"}</b><strong>{total.a} — {total.b}</strong><b>{team2?.name || "Team 2"}</b></div>;
+            })()}
+          </Card>
 
           <Card title="Course Rotation">
             {rounds.map((r) => (
@@ -537,12 +628,24 @@ export default function App() {
               );
             })}
           </Card>
-          <Card title="Jander Cup Scoring">
-            <p>
-              Pairings and format-aware score entry are now live. Automatic match points,
-              front/back bonuses and the overall team total are the next scoring layer.
-            </p>
+          <Card title="Jander Cup Team Score">
+            {(() => {
+              const total = teamTournamentTotals();
+              return <div className="row"><b>{team1?.name || "Team 1"} {total.a}</b><span>vs</span><strong>{total.b} {team2?.name || "Team 2"}</strong></div>;
+            })()}
           </Card>
+          {rounds.filter((r) => r.round_number <= 4).map((r) => (
+            <Card key={r.id} title={`Round ${r.round_number} • ${fmt(r.format)}`}>
+              {matchups.filter((m) => m.round_id === r.id).sort((a,b) => a.matchup_number-b.matchup_number).map((m) => {
+                const x = matchupSummary(m, r);
+                return <div className="row" key={m.id}>
+                  <b>Match {m.matchup_number}</b>
+                  <span>{x.aHole}-{x.bHole} holes • F {x.aFront}-{x.bFront} • B {x.aBack}-{x.bBack}</span>
+                  <strong>{x.aTotal}-{x.bTotal}</strong>
+                </div>;
+              })}
+            </Card>
+          ))}
         </>
       )}
 
